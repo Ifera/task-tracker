@@ -1,59 +1,29 @@
-import { useState, useRef, type CSSProperties } from "react";
+import { useState, useEffect, type CSSProperties } from "react";
+import { supabase } from "./lib/supabase";
+import { signOut } from "./lib/auth";
+import { fetchTasks, upsertTask, removeTask } from "./lib/tasks";
+import type { Task, TaskUpdate } from "./lib/tasks";
+import AuthScreen from "./components/AuthScreen";
 
-// ─── Types ───────────────────────────────────────────
-interface TaskUpdate {
-  text: string;
-  date: string;
-}
+// ─── Config ──────────────────────────────────────────
 
-interface Task {
-  id: string;
-  title: string;
-  description: string;
-  assignedBy: string;
-  assignerName: string;
-  priority: string;
-  status: string;
-  dateAssigned: string;
-  deadline: string;
-  updates: TaskUpdate[];
-  remarks: string;
-}
-
-interface BadgeConfig {
-  color: string;
-  bg: string;
-  label: string;
-}
-
-interface StatusConfig {
-  color: string;
-  bg: string;
-}
-
-interface SectionMeta {
-  color: string;
-  label: string;
-}
-
+interface BadgeConfig { color: string; bg: string; label: string; }
+interface StatusConfig { color: string; bg: string; }
+interface SectionMeta { color: string; label: string; }
 type View = "list" | "form" | "detail";
-
-interface Filter {
-  priority: string;
-  status: string;
-  assigner: string;
-}
+interface Filter { priority: string; status: string; assigner: string; }
+interface AppUser { id: string; username: string; }
 
 const PRIORITY_CONFIG: Record<string, BadgeConfig> = {
-  High: { color: "#C0392B", bg: "#FDEDEC", label: "HIGH" },
-  Medium: { color: "#D68910", bg: "#FEF9E7", label: "MED" },
-  Low: { color: "#1A5276", bg: "#EAF2FF", label: "LOW" },
+  High:   { color: "#C0392B", bg: "#FDEDEC", label: "HIGH" },
+  Medium: { color: "#D68910", bg: "#FEF9E7", label: "MED"  },
+  Low:    { color: "#1A5276", bg: "#EAF2FF", label: "LOW"  },
 };
 
 const STATUS_CONFIG: Record<string, StatusConfig> = {
-  Pending: { color: "#7F8C8D", bg: "#F2F3F4" },
+  Pending:       { color: "#7F8C8D", bg: "#F2F3F4" },
   "In Progress": { color: "#1A5276", bg: "#EAF2FF" },
-  Completed: { color: "#1E8449", bg: "#EAFAF1" },
+  Completed:     { color: "#1E8449", bg: "#EAFAF1" },
 };
 
 const ASSIGNERS: string[] = ["CO", "2IC", "ATO", "Other Officer"];
@@ -81,15 +51,7 @@ function formatDate(d: string): string {
   });
 }
 
-function Badge({
-  label,
-  color,
-  bg,
-}: {
-  label: string;
-  color: string;
-  bg: string;
-}) {
+function Badge({ label, color, bg }: { label: string; color: string; bg: string }) {
   return (
     <span
       style={{
@@ -110,50 +72,71 @@ function Badge({
 }
 
 const SECTION_META: Record<string, SectionMeta> = {
-  Pending: { color: "#7F8C8D", label: "Pending" },
+  Pending:       { color: "#7F8C8D", label: "Pending"     },
   "In Progress": { color: "#1A5276", label: "In Progress" },
-  Completed: { color: "#1E8449", label: "Completed" },
+  Completed:     { color: "#1E8449", label: "Completed"   },
 };
 
 const PRIORITY_ORDER: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
 
+// ─── App ─────────────────────────────────────────────
+
 export default function App() {
-  const [tasks, setTasks] = useState<Task[]>(() => {
-    try {
-      const raw = localStorage.getItem("tasks_v1");
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
-  const [view, setView] = useState<View>("list"); // list | form | detail
+  const [user, setUser] = useState<AppUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [view, setView] = useState<View>("list");
   const [editTask, setEditTask] = useState<Task | null>(null);
   const [detailTask, setDetailTask] = useState<Task | null>(null);
-  const [filter, setFilter] = useState<Filter>({
-    priority: "All",
-    status: "All",
-    assigner: "All",
-  });
+  const [filter, setFilter] = useState<Filter>({ priority: "All", status: "All", assigner: "All" });
   const [newUpdate, setNewUpdate] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Save to localStorage with debounce
-  const persistTasks = (updated: Task[]) => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    setSaving(true);
-    saveTimer.current = setTimeout(() => {
-      try {
-        localStorage.setItem("tasks_v1", JSON.stringify(updated));
-      } catch {}
-      setSaving(false);
-    }, 600);
-  };
+  // ─── Auth session management ─────────────────────
 
-  const saveTasks = (updated: Task[]) => {
-    setTasks(updated);
-    persistTasks(updated);
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user) {
+        setUser({
+          id: session.user.id,
+          username: session.user.user_metadata?.username ?? "User",
+        });
+      }
+      setAuthChecked(true);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user) {
+        setUser({
+          id: session.user.id,
+          username: session.user.user_metadata?.username ?? "User",
+        });
+      } else {
+        setUser(null);
+        setTasks([]);
+      }
+      setAuthChecked(true);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ─── Load tasks when user is determined ──────────
+
+  useEffect(() => {
+    if (!user) return;
+    setLoading(true);
+    fetchTasks(user.id)
+      .then(setTasks)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [user?.id]);
+
+  // ─── Handlers ────────────────────────────────────
+
+  const handleLogout = async () => {
+    await signOut();
   };
 
   const openNew = () => {
@@ -172,44 +155,45 @@ export default function App() {
     setView("detail");
   };
 
-  const submitForm = () => {
-    if (!editTask) return;
-    const current = editTask;
-    if (!current.title.trim()) return;
-    const exists = tasks.find((t) => t.id === current.id);
+  const submitForm = async () => {
+    if (!editTask || !user) return;
+    if (!editTask.title.trim()) return;
+    const exists = tasks.find((t) => t.id === editTask.id);
     const updated = exists
-      ? tasks.map((t) => (t.id === current.id ? current : t))
-      : [current, ...tasks];
-    saveTasks(updated);
+      ? tasks.map((t) => (t.id === editTask.id ? editTask : t))
+      : [editTask, ...tasks];
+    setTasks(updated);
     setView("list");
+    await upsertTask(editTask, user.id).catch(() => {});
   };
 
-  const deleteTask = (id: string) => {
-    saveTasks(tasks.filter((t) => t.id !== id));
+  const deleteTask = async (id: string) => {
+    setTasks(tasks.filter((t) => t.id !== id));
     setView("list");
+    await removeTask(id).catch(() => {});
   };
 
-  const addUpdate = () => {
-    if (!newUpdate.trim() || !detailTask) return;
-    const dt = detailTask;
-    const update: TaskUpdate = {
-      text: newUpdate.trim(),
-      date: new Date().toISOString(),
-    };
-    const updated = tasks.map((t) =>
-      t.id === dt.id ? { ...t, updates: [...(t.updates || []), update] } : t
-    );
-    const refreshed = updated.find((t) => t.id === dt.id);
-    if (refreshed) setDetailTask(refreshed);
-    saveTasks(updated);
+  const addUpdate = async () => {
+    if (!newUpdate.trim() || !detailTask || !user) return;
+    const update: TaskUpdate = { text: newUpdate.trim(), date: new Date().toISOString() };
+    const updatedTask = { ...detailTask, updates: [...(detailTask.updates || []), update] };
+    const updatedTasks = tasks.map((t) => (t.id === detailTask.id ? updatedTask : t));
+    setTasks(updatedTasks);
+    setDetailTask(updatedTask);
     setNewUpdate("");
+    await upsertTask(updatedTask, user.id).catch(() => {});
   };
 
-  const updateStatus = (id: string, status: string) => {
-    const updated = tasks.map((t) => (t.id === id ? { ...t, status } : t));
-    saveTasks(updated);
-    if (detailTask?.id === id) setDetailTask({ ...detailTask, status });
+  const updateStatus = async (id: string, status: string) => {
+    const task = tasks.find((t) => t.id === id);
+    if (!task || !user) return;
+    const updatedTask = { ...task, status };
+    setTasks(tasks.map((t) => (t.id === id ? updatedTask : t)));
+    if (detailTask?.id === id) setDetailTask(updatedTask);
+    await upsertTask(updatedTask, user.id).catch(() => {});
   };
+
+  // ─── Filters / stats ─────────────────────────────
 
   const filtered = tasks.filter((t) => {
     if (filter.priority !== "All" && t.priority !== filter.priority) return false;
@@ -225,14 +209,14 @@ export default function App() {
   });
 
   const counts = {
-    High: tasks.filter((t) => t.priority === "High" && t.status !== "Completed")
-      .length,
+    High:    tasks.filter((t) => t.priority === "High" && t.status !== "Completed").length,
     Pending: tasks.filter((t) => t.status === "Pending").length,
-    Total: tasks.length,
-    Done: tasks.filter((t) => t.status === "Completed").length,
+    Total:   tasks.length,
+    Done:    tasks.filter((t) => t.status === "Completed").length,
   };
 
-  // ─── Styles ───────────────────────────────────────────
+  // ─── Styles ──────────────────────────────────────
+
   const s: Record<string, CSSProperties> = {
     root: {
       fontFamily: "'Inter', 'Segoe UI', sans-serif",
@@ -253,24 +237,30 @@ export default function App() {
     },
     logo: { fontSize: 13, fontWeight: 700, letterSpacing: 2, opacity: 0.7 },
     title: { fontSize: 20, fontWeight: 800, letterSpacing: 0.5 },
-    syncBadge: {
-      fontSize: 10,
-      background: saving ? "#F39C12" : "#1E8449",
+    userArea: { display: "flex", alignItems: "center", gap: 8, flexShrink: 0 },
+    userBadge: {
+      fontSize: 11,
+      background: "#ffffff22",
       color: "#fff",
-      padding: "2px 8px",
+      padding: "4px 10px",
       borderRadius: 10,
       fontWeight: 600,
+      letterSpacing: 0.3,
     },
-    statsRow: {
-      display: "flex",
-      gap: 12,
-      paddingBottom: 14,
-      overflowX: "auto",
+    logoutBtn: {
+      fontSize: 11,
+      background: "transparent",
+      color: "#ffffff99",
+      border: "1px solid #ffffff33",
+      padding: "4px 10px",
+      borderRadius: 10,
+      fontWeight: 600,
+      cursor: "pointer",
+      letterSpacing: 0.3,
+      fontFamily: "inherit",
     },
-    stat: {
-      textAlign: "center",
-      minWidth: 60,
-    },
+    statsRow: { display: "flex", gap: 12, paddingBottom: 14, overflowX: "auto" },
+    stat: { textAlign: "center", minWidth: 60 },
     statNum: { fontSize: 22, fontWeight: 800 },
     statLabel: { fontSize: 9, opacity: 0.65, letterSpacing: 1, fontWeight: 600 },
     content: { padding: "14px 16px", maxWidth: 800, margin: "0 auto" },
@@ -321,21 +311,9 @@ export default function App() {
       cursor: "pointer",
       transition: "box-shadow 0.15s",
     },
-    cardTop: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "flex-start",
-      gap: 8,
-    },
+    cardTop: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 },
     cardTitle: { fontWeight: 700, fontSize: 14, flex: 1 },
-    cardMeta: {
-      fontSize: 11,
-      color: "#7F8C8D",
-      marginTop: 4,
-      display: "flex",
-      gap: 10,
-      flexWrap: "wrap",
-    },
+    cardMeta: { fontSize: 11, color: "#7F8C8D", marginTop: 4, display: "flex", gap: 10, flexWrap: "wrap" },
     cardUpdate: {
       fontSize: 11,
       color: "#555",
@@ -453,24 +431,9 @@ export default function App() {
       border: "2px solid",
     },
     empty: { textAlign: "center", padding: "48px 0", color: "#AAB" },
-    sectionHeader: {
-      display: "flex",
-      alignItems: "center",
-      gap: 8,
-      margin: "18px 0 10px",
-    },
-    sectionDot: {
-      width: 8,
-      height: 8,
-      borderRadius: "50%",
-      flexShrink: 0,
-    },
-    sectionTitle: {
-      fontSize: 13,
-      fontWeight: 800,
-      letterSpacing: 0.5,
-      textTransform: "uppercase",
-    },
+    sectionHeader: { display: "flex", alignItems: "center", gap: 8, margin: "18px 0 10px" },
+    sectionDot: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0 },
+    sectionTitle: { fontSize: 13, fontWeight: 800, letterSpacing: 0.5, textTransform: "uppercase" },
     sectionCount: {
       fontSize: 11,
       fontWeight: 700,
@@ -479,14 +442,8 @@ export default function App() {
       borderRadius: 10,
       padding: "1px 8px",
     },
-    sectionLine: {
-      flex: 1,
-      height: 1,
-      background: "#E0E4EA",
-    },
-    completedCard: {
-      opacity: 0.8,
-    },
+    sectionLine: { flex: 1, height: 1, background: "#E0E4EA" },
+    completedCard: { opacity: 0.8 },
     checkCircle: {
       width: 18,
       height: 18,
@@ -500,9 +457,39 @@ export default function App() {
       justifyContent: "center",
       flexShrink: 0,
     },
+    spinner: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      minHeight: "100vh",
+      fontFamily: "'Inter', 'Segoe UI', sans-serif",
+    },
   };
 
-  // ─── Render ───────────────────────────────────────────
+  // ─── Auth / loading guards ────────────────────────
+
+  if (!authChecked) {
+    return (
+      <div style={{ ...s.spinner, background: "#0D2137" }}>
+        <div style={{ color: "#ffffff88", fontWeight: 700, fontSize: 14 }}>Loading…</div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen onAuth={() => {}} />;
+  }
+
+  if (loading) {
+    return (
+      <div style={{ ...s.spinner, background: "#F0F2F5" }}>
+        <div style={{ color: "#1A3A5C", fontWeight: 700, fontSize: 14 }}>Loading tasks…</div>
+      </div>
+    );
+  }
+
+  // ─── Render ──────────────────────────────────────
+
   return (
     <div style={s.root}>
       {/* Header */}
@@ -512,14 +499,19 @@ export default function App() {
             <div style={s.logo}>PAKISTAN ARMY</div>
             <div style={s.title}>Task Tracker</div>
           </div>
-          <span style={s.syncBadge}>{saving ? "⟳ Syncing" : "✓ Synced"}</span>
+          <div style={s.userArea}>
+            <span style={s.userBadge}>👤 {user.username}</span>
+            <button style={s.logoutBtn} onClick={handleLogout}>
+              Logout
+            </button>
+          </div>
         </div>
         <div style={s.statsRow}>
           {[
-            { num: counts.Total, label: "TOTAL" },
-            { num: counts.Pending, label: "PENDING" },
-            { num: counts.High, label: "HIGH PRI" },
-            { num: counts.Done, label: "COMPLETED" },
+            { num: counts.Total,   label: "TOTAL"     },
+            { num: counts.Pending, label: "PENDING"   },
+            { num: counts.High,    label: "HIGH PRI"  },
+            { num: counts.Done,    label: "COMPLETED" },
           ].map((s2) => (
             <div key={s2.label} style={s.stat}>
               <div style={s.statNum}>{s2.num}</div>
@@ -571,7 +563,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Task List — grouped by status */}
+        {/* Task list — grouped by status */}
         {filtered.length === 0 ? (
           <div style={s.empty}>
             <div style={{ fontSize: 36, marginBottom: 8 }}>📋</div>
@@ -615,14 +607,7 @@ export default function App() {
                       onClick={() => openDetail(task)}
                     >
                       <div style={s.cardTop}>
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 7,
-                            flex: 1,
-                          }}
-                        >
+                        <div style={{ display: "flex", alignItems: "center", gap: 7, flex: 1 }}>
                           {isCompleted && <span style={s.checkCircle}>✓</span>}
                           <div
                             style={{
@@ -728,9 +713,7 @@ export default function App() {
                 <input
                   style={{ ...s.input, marginBottom: 0 }}
                   placeholder={
-                    editTask.assignedBy === "Other Officer"
-                      ? "Required"
-                      : "Optional"
+                    editTask.assignedBy === "Other Officer" ? "Required" : "Optional"
                   }
                   value={editTask.assignerName}
                   onChange={(e) =>
@@ -847,12 +830,7 @@ export default function App() {
                   }}
                 >
                   <div
-                    style={{
-                      fontSize: 17,
-                      fontWeight: 800,
-                      flex: 1,
-                      paddingRight: 8,
-                    }}
+                    style={{ fontSize: 17, fontWeight: 800, flex: 1, paddingRight: 8 }}
                   >
                     {task.title}
                   </div>
@@ -909,7 +887,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Status */}
                 <label style={s.label}>UPDATE STATUS</label>
                 <div style={s.statusBtns}>
                   {Object.entries(STATUS_CONFIG).map(([st, cfg]) => (
@@ -928,7 +905,6 @@ export default function App() {
                   ))}
                 </div>
 
-                {/* Updates log */}
                 <label style={s.label}>
                   PROGRESS LOG ({task.updates?.length || 0})
                 </label>
