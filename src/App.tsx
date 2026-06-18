@@ -1,29 +1,4 @@
-import { useState, useEffect, useRef, type CSSProperties } from "react";
-
-// ─── Persistent storage shape (provided by the host environment) ───
-declare global {
-  interface Window {
-    storage: {
-      get: (
-        key: string,
-        shared?: boolean
-      ) => Promise<{ key: string; value: string; shared: boolean } | null>;
-      set: (
-        key: string,
-        value: string,
-        shared?: boolean
-      ) => Promise<{ key: string; value: string; shared: boolean } | null>;
-      delete: (
-        key: string,
-        shared?: boolean
-      ) => Promise<{ key: string; deleted: boolean; shared: boolean } | null>;
-      list: (
-        prefix?: string,
-        shared?: boolean
-      ) => Promise<{ keys: string[]; prefix?: string; shared: boolean } | null>;
-    };
-  }
-}
+import { useState, useRef, type CSSProperties } from "react";
 
 // ─── Types ───────────────────────────────────────────
 interface TaskUpdate {
@@ -143,7 +118,14 @@ const SECTION_META: Record<string, SectionMeta> = {
 const PRIORITY_ORDER: Record<string, number> = { High: 0, Medium: 1, Low: 2 };
 
 export default function App() {
-  const [tasks, setTasks] = useState<Task[]>([]);
+  const [tasks, setTasks] = useState<Task[]>(() => {
+    try {
+      const raw = localStorage.getItem("tasks_v1");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
   const [view, setView] = useState<View>("list"); // list | form | detail
   const [editTask, setEditTask] = useState<Task | null>(null);
   const [detailTask, setDetailTask] = useState<Task | null>(null);
@@ -154,28 +136,16 @@ export default function App() {
   });
   const [newUpdate, setNewUpdate] = useState("");
   const [saving, setSaving] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load from storage
-  useEffect(() => {
-    (async () => {
-      try {
-        const result = await window.storage.get("tasks_v1", false);
-        if (result?.value) setTasks(JSON.parse(result.value));
-      } catch {}
-      setLoading(false);
-    })();
-  }, []);
-
-  // Save to storage with debounce
+  // Save to localStorage with debounce
   const persistTasks = (updated: Task[]) => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     setSaving(true);
-    saveTimer.current = setTimeout(async () => {
+    saveTimer.current = setTimeout(() => {
       try {
-        await window.storage.set("tasks_v1", JSON.stringify(updated), false);
+        localStorage.setItem("tasks_v1", JSON.stringify(updated));
       } catch {}
       setSaving(false);
     }, 600);
@@ -533,24 +503,6 @@ export default function App() {
   };
 
   // ─── Render ───────────────────────────────────────────
-  if (loading) {
-    return (
-      <div
-        style={{
-          ...s.root,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          minHeight: "100vh",
-        }}
-      >
-        <div style={{ color: "#1A3A5C", fontWeight: 700, fontSize: 15 }}>
-          Loading tasks…
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div style={s.root}>
       {/* Header */}
